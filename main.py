@@ -177,4 +177,3 @@ def honeypot(
         "status": "success",
         "reply": reply
     }
-git add .
