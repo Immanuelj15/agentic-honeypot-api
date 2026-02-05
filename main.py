@@ -1,27 +1,32 @@
-from fastapi import FastAPI, Header, HTTPException
-from typing import Optional
+from fastapi import FastAPI, Header, HTTPException, Body
+from typing import Optional, List, Dict, Any
 
 app = FastAPI(title="Agentic Honeypot API")
 
-API_KEY = "test123"   # tester-la ithu dhaan kudukkanum
+API_KEY = "test123"
 
 @app.get("/")
 def root():
     return {"message": "Honeypot API Running"}
 
 @app.post("/honeypot")
-def honeypot(x_api_key: Optional[str] = Header(None)):
-
-    # 🔐 API key authentication
+def honeypot(
+    payload: Dict[str, Any] = Body(...),
+    x_api_key: Optional[str] = Header(None)
+):
+    # Auth
     if x_api_key != API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API Key"
-        )
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    # ✅ Basic honeypot response (dummy for this phase)
+    # Read incoming scammer message
+    msg = payload.get("message", {})
+    text = msg.get("text", "")
+
+    # Basic honeypot reply (fast + safe)
+    reply_text = "Sorry, I’m confused. Why will my account be blocked?"
+
+    # Return EXACT required format
     return {
-        "status": "ok",
-        "scam_detected": False,
-        "message": "Honeypot active and listening"
+        "status": "success",
+        "reply": reply_text
     }
