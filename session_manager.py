@@ -1,165 +1,132 @@
 """
 Session management for the Honeypot API.
-Tracks conversation state, extracted intelligence, and scoring metrics.
+Thread-safe session tracking with scam detection, intelligence merging,
+red flag identification, and final output builder.
 """
 
 import time
-import threading
-from typing import Dict, Any, List, Optional
-from extraction import extract_all_intelligence, merge_intelligence, extract_from_conversation_history
+from typing import Dict, Any
+from extraction import extract_all_intelligence, merge_intelligence, scan_full_history
 
-
-# Thread-safe session store
-_sessions: Dict[str, Dict[str, Any]] = {}
-_lock = threading.Lock()
-
-# Scam type detection patterns
+# Scam type classification patterns
 SCAM_PATTERNS = {
     "bank_fraud": [
         "bank", "account compromised", "suspicious transaction", "fraud department",
         "sbi", "hdfc", "icici", "axis", "pnb", "rbi", "reserve bank",
-        "account blocked", "account suspended", "debit card", "credit card"
+        "account blocked", "account suspended", "debit card", "credit card",
     ],
     "upi_fraud": [
-        "upi", "paytm", "gpay", "google pay", "phonepe", "cashback",
-        "payment pending", "collect request", "upi pin", "refund",
-        "money transfer", "bhim"
+        "upi", "paytm", "phonepe", "gpay", "google pay", "send money",
+        "collect request", "upi pin", "cashback", "refund",
     ],
     "phishing": [
-        "click", "link", "verify", "update kyc", "kyc expired",
-        "offer", "prize", "winner", "congratulations", "claim",
-        "lottery", "reward", "coupon", "deal", "free"
+        "click", "link", "verify", "update kyc", "login", "password",
+        "amazon", "flipkart", "offer", "prize", "lottery", "won",
+        "selected", "free", "claim", "reward",
     ],
-    "tech_support": [
-        "computer", "virus", "malware", "microsoft", "windows",
-        "remote access", "anydesk", "teamviewer", "tech support",
-        "software", "license"
+    "otp_fraud": [
+        "otp", "one time password", "verification code", "sms code",
+        "share code", "send otp", "enter otp",
     ],
     "insurance_fraud": [
-        "insurance", "policy", "premium", "maturity", "claim settlement",
-        "lic", "policy lapsed", "bonus", "endowment"
-    ],
-    "delivery_fraud": [
-        "delivery", "package", "courier", "shipment", "order",
-        "customs", "parcel", "tracking", "amazon", "flipkart"
+        "insurance", "policy", "premium", "claim settlement",
+        "lic", "policy lapsed", "bonus",
     ],
 }
 
-# Red flag keywords
-RED_FLAGS = [
-    "urgent", "immediately", "otp", "verify", "expir", "blocked",
-    "suspended", "warn", "penalty", "legal action", "arrest",
-    "police", "court", "freeze", "deadline", "last chance",
-    "act now", "right away", "don't delay", "hurry", "emergency",
-    "fine", "fee", "charge", "pay now", "transfer", "time sensitive"
+RED_FLAG_KEYWORDS = [
+    "urgent", "immediately", "blocked", "suspended", "otp", "verify",
+    "click", "link", "fee", "charge", "limited time", "expire",
+    "arrest", "legal", "penalty", "hurry", "last chance",
 ]
+
+# In-memory session store
+session_store: Dict[str, Dict[str, Any]] = {}
 
 
 def get_or_create_session(session_id: str) -> Dict[str, Any]:
     """Get existing session or create a new one."""
-    with _lock:
-        if session_id not in _sessions:
-            _sessions[session_id] = {
-                "startTime": time.time(),
-                "scamDetected": False,
-                "callbackSent": False,
-                "totalMessagesExchanged": 0,
-                "intelligence": {
-                    "phoneNumbers": [],
-                    "bankAccounts": [],
-                    "upiIds": [],
-                    "phishingLinks": [],
-                    "emailAddresses": [],
-                    "caseIds": [],
-                },
-                "scamType": "unknown",
-                "confidenceLevel": 0.0,
-                "redFlagsFound": [],
-                "questionsAsked": 0,
-                "usedResponses": set(),
-                "allScammerTexts": [],
-                "historyProcessed": False,
-            }
-        return _sessions[session_id]
+    if session_id not in session_store:
+        session_store[session_id] = {
+            "startTime": time.time(),
+            "scamDetected": False,
+            "scamType": "unknown",
+            "confidenceLevel": 0.0,
+            "intelligence": {
+                "phoneNumbers": [], "bankAccounts": [], "upiIds": [],
+                "phishingLinks": [], "emailAddresses": [], "caseIds": [],
+            },
+            "redFlagsFound": [],
+            "questionsAsked": 0,
+            "totalMessagesExchanged": 0,
+            "callbackSent": False,
+            "usedResponses": set(),
+        }
+    return session_store[session_id]
 
 
-def update_session(session_id: str, text: str, conversation_history: List[Dict], reply: str) -> Dict[str, Any]:
-    """Update session with new message data and return updated session."""
+def get_session(session_id: str):
+    """Get session by ID, returns None if not found."""
+    return session_store.get(session_id)
+
+
+def mark_callback_sent(session_id: str):
+    """Mark that the callback has been sent for a session."""
+    if session_id in session_store:
+        session_store[session_id]["callbackSent"] = True
+
+
+def classify_scam(text: str) -> tuple:
+    """Classify scam type based on keyword scoring."""
+    t = text.lower()
+    scores = {}
+    for scam_type, keywords in SCAM_PATTERNS.items():
+        score = sum(1 for k in keywords if k in t)
+        if score > 0:
+            scores[scam_type] = score
+    if scores:
+        best = max(scores, key=scores.get)
+        confidence = min(scores[best] / 5.0, 1.0)
+        return best, confidence
+    return "unknown", 0.0
+
+
+def update_session(session_id: str, text: str, conversation_history: list, reply: str):
+    """Update session with new intelligence, scam detection, and metrics."""
     session = get_or_create_session(session_id)
 
-    with _lock:
-        # Process full conversation history on first encounter
-        if not session["historyProcessed"] and conversation_history:
-            history_intel = extract_from_conversation_history(conversation_history)
-            session["intelligence"] = merge_intelligence(session["intelligence"], history_intel)
+    # Extract from current message
+    current_intel = extract_all_intelligence(text)
 
-            # Extract red flags from history
-            for msg in conversation_history:
-                if msg.get("sender") == "scammer":
-                    msg_text = msg.get("text", "").lower()
-                    for flag in RED_FLAGS:
-                        if flag in msg_text and flag not in session["redFlagsFound"]:
-                            session["redFlagsFound"].append(flag)
+    # Also scan full history
+    history_intel = scan_full_history(conversation_history)
 
-            session["historyProcessed"] = True
+    # Merge all intelligence
+    session["intelligence"] = merge_intelligence(session["intelligence"], current_intel)
+    session["intelligence"] = merge_intelligence(session["intelligence"], history_intel)
 
-        # Store scammer text
-        session["allScammerTexts"].append(text)
+    # Detect scam using full conversation text
+    full_text = text + " " + " ".join(
+        m.get("text", "") for m in conversation_history if m.get("sender") == "scammer"
+    )
+    scam_type, confidence = classify_scam(full_text)
+    if confidence > 0:
+        session["scamDetected"] = True
+        if confidence > session["confidenceLevel"]:
+            session["scamType"] = scam_type
+            session["confidenceLevel"] = confidence
 
-        # Extract intelligence from current message
-        current_intel = extract_all_intelligence(text)
-        session["intelligence"] = merge_intelligence(session["intelligence"], current_intel)
+    # Red flags
+    t = text.lower()
+    for flag in RED_FLAG_KEYWORDS:
+        if flag in t and flag not in session["redFlagsFound"]:
+            session["redFlagsFound"].append(flag)
 
-        # Update message count — history has both scammer + user messages
-        # Plus current scammer message + our reply = +2
-        session["totalMessagesExchanged"] = len(conversation_history) + 2
+    # Questions asked
+    session["questionsAsked"] += reply.count("?")
 
-        # Detect scam
-        text_lower = text.lower()
-        scam_signals = 0
-        scam_keywords = [
-            "otp", "verify", "urgent", "blocked", "suspended", "kyc",
-            "fraud", "security", "transaction", "click", "link",
-            "immediately", "expired", "penalty", "legal", "arrest",
-            "fee", "charge", "transfer", "pin", "password", "cvv"
-        ]
-        for keyword in scam_keywords:
-            if keyword in text_lower:
-                scam_signals += 1
-
-        if scam_signals > 0:
-            session["scamDetected"] = True
-
-        # Detect scam type
-        all_text = " ".join(session["allScammerTexts"]).lower()
-        best_type = "unknown"
-        best_score = 0
-        for stype, patterns in SCAM_PATTERNS.items():
-            score = sum(1 for p in patterns if p in all_text)
-            if score > best_score:
-                best_score = score
-                best_type = stype
-        session["scamType"] = best_type
-
-        # Calculate confidence
-        total_signals = scam_signals
-        for prev_text in session["allScammerTexts"][:-1]:
-            for keyword in scam_keywords:
-                if keyword in prev_text.lower():
-                    total_signals += 1
-        session["confidenceLevel"] = min(1.0, round(total_signals * 0.15, 2))
-
-        # Extract red flags
-        for flag in RED_FLAGS:
-            if flag in text_lower and flag not in session["redFlagsFound"]:
-                session["redFlagsFound"].append(flag)
-
-        # Count questions in our reply
-        if "?" in reply:
-            session["questionsAsked"] += reply.count("?")
-
-        # Track used responses
-        session["usedResponses"].add(reply)
+    # Message count — history + current scammer message + our reply
+    session["totalMessagesExchanged"] = len(conversation_history) + 2
 
     return session
 
@@ -167,10 +134,10 @@ def update_session(session_id: str, text: str, conversation_history: List[Dict],
 def build_final_output(session_id: str) -> Dict[str, Any]:
     """Build the final output payload for submission."""
     session = get_or_create_session(session_id)
-
     duration = int(time.time() - session["startTime"])
 
-    # Build agent notes
+    is_scam = session["scamDetected"]
+
     red_flags_str = ", ".join(session["redFlagsFound"][:10]) if session["redFlagsFound"] else "suspicious behavior"
     agent_notes = (
         f"Scam type detected: {session['scamType']}. "
@@ -179,8 +146,6 @@ def build_final_output(session_id: str) -> Dict[str, Any]:
         f"Total questions asked: {session['questionsAsked']}. "
         f"Intelligence extracted across {session['totalMessagesExchanged']} messages."
     )
-
-    is_scam = session["scamDetected"]
 
     return {
         "sessionId": session_id,
@@ -199,16 +164,3 @@ def build_final_output(session_id: str) -> Dict[str, Any]:
         },
         "agentNotes": agent_notes,
     }
-
-
-def get_session(session_id: str) -> Optional[Dict[str, Any]]:
-    """Get session data (read-only)."""
-    with _lock:
-        return _sessions.get(session_id)
-
-
-def mark_callback_sent(session_id: str):
-    """Mark that callback has been sent for this session."""
-    with _lock:
-        if session_id in _sessions:
-            _sessions[session_id]["callbackSent"] = True

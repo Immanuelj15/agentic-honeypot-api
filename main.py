@@ -10,8 +10,7 @@ import requests
 import time
 import logging
 
-from config import API_KEY, GUVI_CALLBACK_URL, FINAL_OUTPUT_MIN_TURN, MAX_TURNS
-from extraction import extract_all_intelligence, merge_intelligence
+from config import API_KEY, GUVI_CALLBACK_URL, FINAL_OUTPUT_MIN_TURN
 from conversation import generate_reply
 from session_manager import (
     get_or_create_session,
@@ -77,7 +76,6 @@ def honeypot(
     message = payload.get("message", {})
     text = message.get("text", "")
     conversation_history = payload.get("conversationHistory", [])
-    metadata = payload.get("metadata", {})
 
     if not session_id or not text:
         raise HTTPException(status_code=400, detail="Missing sessionId or message text")
@@ -85,7 +83,7 @@ def honeypot(
     # Calculate turn number
     turn = len(conversation_history)
 
-    logger.info(f"Session {session_id} | Turn {turn + 1} | Message: {text[:80]}...")
+    logger.info(f"Session {session_id} | Turn {turn + 1} | Message: {text[:80]}")
 
     # Get session
     session = get_or_create_session(session_id)
@@ -96,13 +94,13 @@ def honeypot(
         conversation_history=conversation_history,
         turn=turn,
         used_responses=session.get("usedResponses", set()),
+        scam_detected=session.get("scamDetected", False),
     )
 
     # Update session with new intelligence and metrics
     session = update_session(session_id, text, conversation_history, reply)
 
-    logger.info(f"Session {session_id} | Reply: {reply[:80]}...")
-    logger.info(f"Session {session_id} | Intel: {session['intelligence']}")
+    logger.info(f"Session {session_id} | Reply: {reply[:80]}")
 
     # Progressive final output — send callback after FINAL_OUTPUT_MIN_TURN
     if turn >= FINAL_OUTPUT_MIN_TURN:
@@ -155,7 +153,6 @@ def debug_session(session_id: str, x_api_key: Optional[str] = Header(None)):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Build a serializable version (remove set)
     safe_session = {k: v for k, v in session.items() if k != "usedResponses"}
     safe_session["usedResponsesCount"] = len(session.get("usedResponses", set()))
 

@@ -1,12 +1,16 @@
 """
-LLM-powered conversation engine for the Honeypot API.
-Uses Hugging Face Inference API with fallback to rule-based responses.
+Conversation engine for the Honeypot API.
+Uses HuggingFace LLM with smart fallback responses,
+response deduplication, and scam-context-aware category selection.
 """
 
-import requests
 import random
-from typing import List, Dict, Optional
-from config import HF_API_TOKEN, HF_API_URL
+import requests
+from typing import Optional
+
+from config import HF_API_TOKEN, HF_MODEL
+
+# ---- System Prompt for LLM ----
 
 SYSTEM_PROMPT = """You are playing the role of a naive, slightly worried Indian citizen who has received a suspicious message. Your goal is to keep the scammer engaged for as long as possible while extracting maximum information from them.
 
@@ -16,99 +20,10 @@ CRITICAL RULES:
 3. Keep responses SHORT (1-3 sentences max).
 4. Show willingness to comply but always ask for "verification" first.
 5. Reference specific red flags subtly (urgency, OTP requests, suspicious links).
-
-QUESTION STRATEGIES (rotate through these):
-- Ask for their full name, employee ID, or badge number
-- Ask which branch or department they're from
-- Request their direct phone number or extension
-- Ask for a reference/case number for your records
-- Ask them to verify YOUR details first (name, last 4 digits of account)
-- Ask for their official email address
-- Request their supervisor's name and contact
-- Ask for the official website URL to verify
-- Ask why they need sensitive info over phone/SMS/WhatsApp
-- Express concern and ask to visit the branch in person
-- Ask for official letter or documentation
-- Request a callback number to verify
-
-TONE: Worried, cooperative but cautious. Use simple, everyday language. Occasionally express urgency back ("Oh no, what should I do?") to keep them talking.
-
-IMPORTANT: Never use markdown formatting. Never use asterisks, bold, or bullet points. Respond in plain conversational text only."""
-
-
-def build_messages(current_text: str, conversation_history: List[Dict], turn: int) -> str:
-    """Build the prompt for the Hugging Face model."""
-    prompt = f"<s>[INST] {SYSTEM_PROMPT}\n\n"
-
-    # Add conversation history
-    if conversation_history:
-        prompt += "Previous conversation:\n"
-        for msg in conversation_history[-6:]:  # Last 6 messages for context
-            sender = msg.get("sender", "unknown")
-            text = msg.get("text", "")
-            if sender == "scammer":
-                prompt += f"Scammer: {text}\n"
-            else:
-                prompt += f"You (victim): {text}\n"
-
-    prompt += f"\nScammer's latest message: {current_text}\n"
-    prompt += f"\nThis is turn {turn + 1} of the conversation. "
-
-    if turn < 2:
-        prompt += "You are just starting. Act worried and ask for their identity credentials."
-    elif turn < 5:
-        prompt += "Keep probing for details. Ask for phone number, email, or reference number."
-    elif turn < 8:
-        prompt += "You've been talking a while. Ask for their supervisor or official website."
-    else:
-        prompt += "This is near the end. Try to get any remaining details like address or documentation."
-
-    prompt += "\n\nRespond as the victim in 1-3 short sentences. Do NOT use any markdown formatting, asterisks, bold text, or bullet points. [/INST]"
-
-    return prompt
-
-
-def call_huggingface(prompt: str) -> Optional[str]:
-    """Call Hugging Face Inference API."""
-    if not HF_API_TOKEN:
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 150,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "do_sample": True,
-            "return_full_text": False
-        }
-    }
-
-    try:
-        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=25)
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                text = result[0].get("generated_text", "").strip()
-                # Clean up any artifacts
-                text = text.replace("[/INST]", "").replace("<s>", "").replace("</s>", "").strip()
-                # Remove any markdown formatting
-                text = text.replace("**", "").replace("__", "")
-                # Remove lines that start with - or * (bullet points)
-                lines = text.split("\n")
-                cleaned_lines = [l for l in lines if not l.strip().startswith(("-", "*", "•"))]
-                text = " ".join(cleaned_lines).strip()
-                if text:
-                    return text
-        return None
-    except Exception:
-        return None
-
+6. Try to extract: phone numbers, email addresses, UPI IDs, official websites, employee IDs.
+7. Sound natural — use simple language, occasional Hindi words, show emotions.
+8. DO NOT use markdown formatting, bullet points, or numbered lists.
+9. Vary your responses — never repeat the same question twice."""
 
 # ---- Fallback Rule-Based Responses ----
 
@@ -168,7 +83,6 @@ def get_contextual_category(text: str, turn: int) -> str:
     """Determine the best response category based on message content and turn."""
     t = text.lower()
 
-    # Check for scam-related keywords first
     scam_signals = [
         "otp", "verify", "urgent", "blocked", "suspended", "kyc",
         "fraud", "security", "transaction", "click", "link",
@@ -176,11 +90,12 @@ def get_contextual_category(text: str, turn: int) -> str:
         "fee", "charge", "transfer", "pin", "password", "cvv",
         "compromised", "won", "prize", "lottery", "cashback",
         "offer", "claim", "reward", "congratulations", "selected",
-        "http", "www", "bank", "account"
+        "http", "www", "bank", "account", "warning", "fast",
+        "act now", "last chance", "final", "expire", "hurry",
+        "reference", "department", "officer", "employee",
     ]
     is_suspicious = any(sig in t for sig in scam_signals)
 
-    # If no scam signals, treat as benign
     if not is_suspicious:
         return "benign"
 
@@ -201,38 +116,79 @@ def get_contextual_category(text: str, turn: int) -> str:
         return "late"
 
 
-def fallback_reply(text: str, turn: int, used_responses: set) -> str:
-    """Generate a fallback response when LLM is unavailable."""
-    category = get_contextual_category(text, turn)
-    candidates = FALLBACK_RESPONSES.get(category, FALLBACK_RESPONSES["mid"])
+def call_huggingface(prompt: str) -> Optional[str]:
+    """Call HuggingFace Inference API for LLM response."""
+    if not HF_API_TOKEN:
+        return None
+    try:
+        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 100,
+                "temperature": 0.7,
+                "do_sample": True,
+                "return_full_text": False,
+            },
+        }
+        response = requests.post(
+            f"https://api-inference.huggingface.co/models/{HF_MODEL}",
+            headers=headers, json=payload, timeout=15,
+        )
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and result:
+                text = result[0].get("generated_text", "").strip()
+                if text and len(text) > 10 and len(text) < 300:
+                    return text.split("\n")[0]
+        return None
+    except Exception:
+        return None
 
-    # Try to pick an unused response
-    available = [r for r in candidates if r not in used_responses]
-    if not available:
-        # All used, pick from time-based fallback
-        time_cat = "early" if turn < 3 else ("mid" if turn < 6 else "late")
-        available = [r for r in FALLBACK_RESPONSES[time_cat] if r not in used_responses]
-    if not available:
-        available = candidates  # Reset if all exhausted
 
-    response = random.choice(available)
-    return response
-
-
-def generate_reply(
-    current_text: str,
-    conversation_history: List[Dict],
-    turn: int,
-    used_responses: set
-) -> str:
-    """Generate a reply using LLM with fallback to rule-based."""
-
+def generate_reply(current_text: str, conversation_history: list,
+                   turn: int, used_responses: set, scam_detected: bool = False) -> str:
+    """Generate a reply using LLM with smart fallback and deduplication."""
     # Try LLM first
-    prompt = build_messages(current_text, conversation_history, turn)
-    llm_response = call_huggingface(prompt)
+    if HF_API_TOKEN:
+        chat_context = ""
+        for msg in conversation_history[-6:]:
+            role = "Scammer" if msg.get("sender") == "scammer" else "You"
+            chat_context += f"{role}: {msg.get('text', '')}\n"
+        chat_context += f"Scammer: {current_text}\n"
 
-    if llm_response and len(llm_response) > 10:
-        return llm_response
+        prompt = f"<s>[INST] {SYSTEM_PROMPT}\n\n{chat_context}\nRespond as the person being called (1-3 sentences, ask one question): [/INST]"
+        llm_reply = call_huggingface(prompt)
+        if llm_reply:
+            return llm_reply
 
-    # Fallback to rule-based
-    return fallback_reply(current_text, turn, used_responses)
+    # Fallback with deduplication
+    category = get_contextual_category(current_text, turn)
+
+    # If scam already detected in session, never use benign responses
+    if scam_detected and category == "benign":
+        if turn < 3:
+            category = "early"
+        elif turn < 6:
+            category = "mid"
+        else:
+            category = "late"
+
+    responses = FALLBACK_RESPONSES.get(category, FALLBACK_RESPONSES["early"])
+
+    available = [r for r in responses if r not in used_responses]
+    if not available:
+        # Try other categories
+        for cat in ["mid", "late", "early"]:
+            if cat != category:
+                alt = [r for r in FALLBACK_RESPONSES[cat] if r not in used_responses]
+                if alt:
+                    available = alt
+                    break
+
+    if not available:
+        available = responses
+
+    reply = random.choice(available)
+    used_responses.add(reply)
+    return reply
